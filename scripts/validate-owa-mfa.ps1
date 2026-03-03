@@ -26,6 +26,10 @@ foreach ($path in $paths) {
     }
 }
 
+Write-Host '--- Exchange virtual directory auth checks ---' -ForegroundColor Cyan
+Get-OwaVirtualDirectory | Select-Object Identity, BasicAuthentication, FormsAuthentication | Format-Table -AutoSize
+Get-EcpVirtualDirectory | Select-Object Identity, BasicAuthentication | Format-Table -AutoSize
+
 Write-Host '--- Firewall rules on port 443 ---' -ForegroundColor Cyan
 Get-NetFirewallRule -Direction Inbound -Enabled True |
     Get-NetFirewallPortFilter |

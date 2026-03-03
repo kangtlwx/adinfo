@@ -1,112 +1,130 @@
 # Exchange Server 2019 OWA 真正 MFA（不可绕过）最佳实践实施方案
 
-> 场景：两台 Exchange Server 2019，目标是在 OWA 上实现**真正 MFA**，并从网络与身份两侧确保无法绕过。
+> 场景：两台 Exchange Server 2019，生产环境**不使用 Entra**，且 Exchange 所在环境**无外网访问权限**。
 
-## 1. 关键结论（先说结论）
+## 1. 关键结论（离线/本地化场景）
 
-Exchange 2019 本身不提供可直接用于 OWA 的原生 MFA（不依赖外围网关）。
-要做到“不可绕过”的 MFA，推荐方案是：
+在“无 Entra、无公网依赖”的前提下，要实现 OWA 真正 MFA（不可绕过），推荐采用：
 
-1. 使用 **Microsoft Entra Application Proxy（预身份验证）+ Conditional Access + MFA** 作为 OWA 外网入口。
-2. 两台 Exchange 仅对内提供 OWA，外网**不直连 Exchange**。
-3. 通过防火墙 / WAF / IIS IP 限制，仅允许来自 App Proxy 连接器（或上游反向代理）的流量到达 OWA/ECP。
-4. 同步关闭或限制可绕过 MFA 的旧协议（如 Basic Auth 的残留、外网 EWS/ActiveSync/POP/IMAP 等视业务收敛）。
+1. **AD FS + Web Application Proxy (WAP) 预认证**作为 OWA 唯一入口。
+2. 在 AD FS 上启用**本地第二因子**（优先 Smart Card/证书，或本地 OTP MFA Adapter）。
+3. Exchange 仅对内提供 OWA/ECP，网络层禁止任何客户端直连 Exchange 443。
+4. Exchange IIS 和 Windows 防火墙只允许来自 WAP/LB 的源地址访问 OWA/ECP。
 
-这样 MFA 发生在访问 OWA 之前，且网络路径上没有“直连后门”，才是实际安全意义上的强制 MFA。
+> 核心原则：MFA 必须发生在到达 Exchange 前（身份边界），并在网络路径上切断所有直连后门。
 
 ---
 
-## 2. 目标架构
+## 2. 推荐架构（纯本地）
 
 ```mermaid
 flowchart LR
-  U[Internet User] --> A[Entra ID App Proxy URL]
-  A --> CA[Conditional Access + MFA]
-  CA --> C1[App Proxy Connector 1]
-  CA --> C2[App Proxy Connector 2]
-  C1 --> VIP[Internal LB / Exchange Namespace]
-  C2 --> VIP
+  U[User] --> WAP[WAP 2019/2022 x2]
+  WAP --> ADFS[AD FS Farm]
+  ADFS --> MFA[Local MFA Adapter / Smart Card CA]
+  WAP --> VIP[Internal LB / Exchange Namespace]
   VIP --> EX1[Exchange 2019 #1]
   VIP --> EX2[Exchange 2019 #2]
 
-  X[Direct Internet to Exchange] -. blocked .-> EX1
+  X[Direct client to Exchange:443] -. blocked .-> EX1
   X -. blocked .-> EX2
 ```
 
 ---
 
-## 3. 实施步骤（生产可落地）
+## 3. 本地 MFA 技术选型（按安全优先级）
 
-## 3.1 Exchange 侧准备
+### A. 首选：AD + Smart Card（证书）
 
-1. 确认两台 CAS/MBX 虚拟目录 URL 一致（OWA/ECP/ActiveSync 等按需整理）。
-2. 仅保留现代认证相关配置，清理不必要的外网发布端点。
-3. TLS 使用有效证书（内外命名策略一致）。
+- 因子 1：AD 账户口令（或 Windows 集成认证策略）。
+- 因子 2：用户证书/智能卡（本地 CA 签发）。
+- 优点：完全离线、本地可控、抗钓鱼能力强（相对 OTP）。
+- 要点：证书生命周期、吊销检查（CRL/OCSP）需高可用。
 
-示例检查命令（手工执行）：
+### B. 次选：AD FS + 本地 OTP MFA Adapter
+
+- 因子 1：AD 口令。
+- 因子 2：本地 OTP（硬件令牌或离线 TOTP 平台）。
+- 适合无法大规模推证书的环境。
+
+> 不建议：仅在 Exchange 上叠加自定义登录页验证码（容易被协议/路径绕过，且升级维护风险高）。
+
+---
+
+## 4. 生产实施步骤
+
+## 4.1 Exchange 双机基线
+
+1. 统一虚拟目录 URL 与证书策略。
+2. 明确仅发布 OWA（以及必要时 ECP 管理入口）。
+3. 清理外网不必要协议（EWS/ActiveSync/POP/IMAP/Autodiscover 外网路径按业务收敛）。
+
+参考检查：
 
 ```powershell
-Get-OwaVirtualDirectory | fl Server,InternalUrl,ExternalUrl,FormsAuthentication
-Get-EcpVirtualDirectory | fl Server,InternalUrl,ExternalUrl
-Get-OrganizationConfig | fl OAuth2ClientProfileEnabled
+Get-OwaVirtualDirectory | fl Server,InternalUrl,ExternalUrl,FormsAuthentication,BasicAuthentication
+Get-EcpVirtualDirectory | fl Server,InternalUrl,ExternalUrl,BasicAuthentication
+Get-MapiVirtualDirectory | fl Server,InternalUrl,ExternalUrl,IISAuthenticationMethods
+Get-ActiveSyncVirtualDirectory | fl Server,InternalUrl,ExternalUrl,BasicAuthEnabled
 ```
 
-## 3.2 部署 Entra Application Proxy
+## 4.2 部署 AD FS + WAP（高可用）
 
-1. 在两台独立 Windows Server（建议非 Exchange）上安装至少 2 个 Connector（高可用）。
-2. 在 Entra ID 中创建 Enterprise Application，发布内部 OWA URL（例如 `https://mail.contoso.local/owa`）。
-3. 预身份验证选择 **Microsoft Entra ID**。
-4. 配置 SSO（通常 KCD / Header based 依环境选择，OWA 常见是 passthrough 到 Exchange forms + Entra 预认证）。
-5. 配置外部访问 URL，例如 `https://mail-contoso.msappproxy.net/owa` 或自定义域。
+1. 部署至少 2 台 AD FS（域内）+ 2 台 WAP（DMZ/边界区）。
+2. WAP 发布 OWA URL（外部用户仅访问 WAP 地址）。
+3. WAP 对 OWA 启用 AD FS 预认证（而非纯透传）。
+4. AD FS 全局策略中，对 OWA 发布应用强制 MFA。
 
-## 3.3 Conditional Access 强制 MFA
+## 4.3 AD FS 强制 MFA 策略
 
-1. 目标对象：仅该 OWA 企业应用（避免误伤）。
-2. 条件：所有用户（先排除 break-glass 账户并进行补偿管控）。
-3. Grant：Require multifactor authentication。
-4. Session：建议加入 Sign-in frequency、Token protection（如可用）。
+- 目标：OWA 发布应用（Relying Party/Application Group）。
+- 条件：所有用户（仅保留受控 break-glass 账户，并限制来源网段 + 审计）。
+- 授予：Require MFA。
+- 建议：对高风险管理员单独策略（更短会话、更严格设备条件）。
 
-## 3.4 反绕过（核心）
+## 4.4 反绕过（必须）
 
-### 网络层必须做到
+### 网络层
 
-- Exchange 外网 443 不直接暴露（公网入口只留 App Proxy/WAF）。
-- Exchange 到外网的 DNS 解析不应把 OWA 公网记录指向 Exchange 真实地址。
-- 防火墙仅放行来自连接器网段（或上游反向代理）到 Exchange 443。
+- Exchange 不暴露客户端可达入口。
+- 仅允许 `WAP/LB -> Exchange:443`。
+- DNS 不给客户端解析到 Exchange 实际地址。
 
-### 服务器层必须做到
+### Exchange 主机层
 
-- IIS `Default Web Site` 的 `/owa`、`/ecp` 启用 IP Allow List（仅信任上游源地址）。
-- Windows 防火墙同样限制 443 来源。
-- 关闭不必要协议外网入口，防止“协议降级绕过 MFA”。
-
----
-
-## 4. 自动化脚本说明
-
-本仓库附带两个脚本：
-
-- `scripts/harden-owa-mfa.ps1`：在 Exchange 上应用 OWA/ECP 的 IIS 与防火墙来源限制。
-- `scripts/validate-owa-mfa.ps1`：检查是否已配置来源限制与关键 OWA 参数。
-
-> 注意：脚本默认示例网段是 RFC5737 文档地址，生产环境必须替换为你真实的 Connector/WAF 出口地址。
+- `/owa`、`/ecp` 仅允许 WAP/LB 源地址（IIS allowUnlisted=false）。
+- Windows 防火墙 443 仅允许受信代理源。
+- 视业务关闭/限制可被外部直接利用的遗留端点。
 
 ---
 
-## 5. 上线验证清单
+## 5. 仓库脚本
 
-1. 外网访问 OWA，必须先出现 Entra 登录 + MFA。
-2. 未通过 MFA 无法进入 OWA。
-3. 直接访问 Exchange 公网 IP:443 不可达（超时或拒绝）。
-4. 从非白名单来源访问内网 Exchange:443 被拒绝。
-5. 审计日志中可同时看到 Entra 登录日志与 Exchange IIS 日志链路。
+- `scripts/harden-owa-mfa.ps1`
+  - 对 OWA/ECP 启用 IIS IP 白名单。
+  - 配置 Windows 防火墙 443 仅允许受信源。
+- `scripts/harden-exchange-auth.ps1`
+  - 按“最小暴露”原则关闭外网不需要的认证/协议（示例模板，可按业务开关）。
+- `scripts/validate-owa-mfa.ps1`
+  - 验证 OWA/ECP 的 IIS IP 限制和 443 防火墙规则。
+
+> 注意：脚本默认 CIDR 为示例文档地址，生产必须改成真实 WAP/LB 出口地址。
 
 ---
 
-## 6. 运维建议
+## 6. 上线验收
 
-- 建立“变更即验证”：每次证书、网络、Connector 变更后执行验证脚本。
-- 每季度复核 Conditional Access 和例外账户。
-- 监控连接器健康与容量，避免单点。
-- 建立紧急访问流程（break-glass），并确保该流程不成为常态绕过路径。
+1. 访问 OWA 必须先到 AD FS 登录并触发第二因子。
+2. 不满足 MFA 的用户无法进入 OWA。
+3. 直连 Exchange IP:443 失败。
+4. 非白名单源访问 Exchange:443 失败。
+5. AD FS 审计、WAP 日志、Exchange IIS 日志可串联追踪。
 
+---
+
+## 7. 运维建议
+
+- 变更后固定执行验证脚本。
+- 季度复核 AD FS MFA 策略与例外账号。
+- 证书/CRL/OCSP 监控纳入告警。
+- 演练 WAP/AD FS 节点故障切换。
